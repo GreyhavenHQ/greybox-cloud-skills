@@ -2,7 +2,7 @@
   "name": "dataindex-connectors",
   "description": "Operate DataIndex ingesters (gmail, calendar, slack, contactdb, api_document) and query indexed entities via REST or MCP.",
   "version": "0.1.0",
-  "author": "Monadical",
-  "homepage": "https://github.com/Monadical/greybox-cloud-skills",
+  "author": "GreyhavenHQ",
+  "homepage": "https://github.com/GreyhavenHQ/greybox-cloud-skills",
   "license": "MIT"
 }

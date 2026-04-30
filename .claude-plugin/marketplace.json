@@ -1,7 +1,7 @@
 {
   "name": "greybox-skills",
   "owner": {
-    "name": "Monadical"
+    "name": "GreyhavenHQ"
   },
   "description": "Claude skills for greybox-cloud customers — richer context for the per-droplet dataindex + contactdb MCPs.",
   "plugins": [
