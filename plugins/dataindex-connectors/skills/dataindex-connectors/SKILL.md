@@ -3,10 +3,10 @@ name: dataindex-connectors
 description: >
   Use the per-Greybox DataIndex + ContactDB MCP servers to query unified
   data (emails, calendar events, meetings, chat, documents) and resolve
-  people to contact_ids. Apply when the user asks to find/search/list/inspect
-  emails, meetings, calendar events, chat conversations, or documents in
-  their Greybox; or to look up a person, get their contact ID, or filter
-  data by who's involved.
+  people to contact_ids. Apply when the user asks to find/search/list/inspect/
+  summarize/count emails, meetings, calendar events, chat conversations,
+  or documents in their Greybox; or to look up a person, get their contact
+  ID, or filter data by who's involved.
 ---
 
 # DataIndex + ContactDB MCP
@@ -25,7 +25,7 @@ Both are reached through the user's per-Greybox MCP install (e.g. `gb-XXXXXX-dat
 | Tool | When to use |
 |---|---|
 | `list_connectors` | Discover which connectors (and therefore entity types) are actually configured in this Greybox. Call before assuming a connector exists. |
-| `query_entities` | **Exhaustive filtered enumeration** with pagination. Use when the user wants *all* matching entities ("list every email from Alice this week", "all meetings in Q1"). |
+| `query_entities` | **Exhaustive filtered enumeration** with pagination. Use when the user wants *all* matching entities ("list every email from Alice this week", "all meetings in Q1", counts). |
 | `search` | **Semantic/hybrid search** — ranked relevance, no pagination. Use for natural-language questions ("what was discussed about hiring", "find anything about the product roadmap"). |
 | `get_entity_by_id` | Fetch one entity in full detail. ID format: `connector_name:native_id`. |
 
@@ -37,13 +37,65 @@ Both are reached through the user's per-Greybox MCP install (e.g. `gb-XXXXXX-dat
 | `query_contacts` | Search/filter people by name, hotness score (0–100 engagement metric), platform, or last-interaction window. |
 | `get_contact_by_id` | Fetch one contact's full record by numeric ID. |
 
+## Required sequence
+
+Follow this order unless the user gives a constraint that requires otherwise:
+
+1. **Resolve people first.** Named person → `query_contacts(search=...)`. Self-reference ("me/my") → `get_me`. Never guess a `contact_id`.
+2. **Verify connectors.** Call `list_connectors` once per request flow; confirm the source you need is configured.
+3. **Choose query mode.** Exhaustive listing/counting → `query_entities`. Natural-language relevance → `search`.
+4. **Fetch full detail only when asked.** `get_entity_by_id`; if content is truncated, pass `max_content_length=null`.
+5. **Check response integrity.** Inspect `partial_failure` and `errors` before claiming "no results".
+
 ## Routing decisions
 
-**`search` vs `query_entities`:** if the user's question is "find/list/count all X" → `query_entities`. If it's "what about X / tell me about X / what was said" → `search`. When unsure, prefer `search` for natural-language questions; it's faster and better-ranked.
+**`search` vs `query_entities`:** "find/list/every/all/count X" → `query_entities`. "what about / tell me about / what was said / discussed" → `search`. When unsure on a natural-language question, prefer `search` — it's faster and better-ranked.
 
-**Resolving people first:** if the user mentions someone by name, **first** call `query_contacts(search="...")` to get the contact_id, then pass that ID into DataIndex via the `contact_ids` filter. Don't guess IDs.
+**Resolving people first:** if the user mentions someone by name, **first** call `query_contacts(search="...")` to get the contact_id, then pass that ID into DataIndex via the `contact_ids` filter.
 
-**Self-references:** "my meetings", "emails I got", "calls I joined" → call `get_me` first to get your own `contact_id`, then filter by it.
+**Self-references:** "my meetings", "emails I got", "calls I joined" → `get_me` first, then filter by your own `contact_id`.
+
+**Keyword → workflow** (see workflows below):
+
+| Trigger words | Workflow |
+|---|---|
+| "during", "while", "at the same time", "in that meeting" | Anchor + Interval Correlation |
+| "after", "follow-up", "later", "what happened next" | Anchor + Follow-up Window |
+| "everything X sent", "timeline", "across tools", "all activity" | Person-Centric Timeline |
+| "about X", "what do we know", "mentions of", "discussion on" | Topic-Centric Evidence Pack |
+| "summarize meeting", "recap with updates", "summary plus follow-up" | Narrative Reconstruction |
+| "did we do", "was this implemented", "follow-through" | Decision-to-Execution Trace |
+| "was this answered", "resolved?", "open question" | Question Resolution Tracker |
+| "context around this", "full thread", "what led to this" | Entity Neighborhood Expansion |
+
+If multiple match, prefer (1) user-stated intent over keyword frequency, (2) the narrowest workflow that answers the question, (3) Narrative Reconstruction for mixed "during + after + summarize" requests.
+
+## Workflows
+
+Pick the smallest workflow that fits. Each is a recipe — combine `search` / `query_entities` / `get_entity_by_id` per the steps.
+
+1. **Anchor + Interval Correlation** — *"what happened during X"*. Pick anchors (often meetings) → derive time windows (with `sync_buffer_minutes`) → `query_entities` for target types within each window → group by anchor.
+
+2. **Anchor + Follow-up Window** — *"what happened after X"*. From each anchor's end time, query the next `followup_window_hours` for related entities → rank by relevance to the anchor topic/participants.
+
+3. **Person-Centric Timeline** — *"everything X sent/discussed this week"*. Resolve contacts → `query_entities(contact_ids=…, entity_types=…, date_from/to=…)` paginated → sort chronologically.
+
+4. **Topic-Centric Evidence Pack** — *"what do we know about Y"*. Seed with `search(query=topic, …)`. If the user wants exhaustive coverage, follow with `query_entities(search=topic_terms, …)` paginated and dedupe.
+
+5. **Narrative Reconstruction (meeting + follow-ups)** — anchor meeting → "during" entities (window ± buffer) → "after" entities (post-window). Synthesize: decisions, action items, unresolved points, later changes.
+
+6. **Decision-to-Execution Trace** — *"did we ship what we agreed"*. Extract decisions from anchor → `search` each decision over `[anchor.start, anchor.end + followup_window]` → map decision → evidence.
+
+7. **Question Resolution Tracker** — extract open questions from anchor → `search` each over the post-window → classify resolved / partial / unresolved.
+
+8. **Entity Neighborhood Expansion** — seed = `get_entity_by_id`. Expand via `parent_id`, `contact_ids` overlap within ±Δ time, and a `search` over key terms in the same window. Rank context.
+
+### Standard defaults
+
+- `sync_buffer_minutes`: 5
+- `followup_window_hours`: 72
+- `sort_by`: `timestamp`, `sort_order`: `desc` (unless user asks otherwise)
+- `limit`: start at 20–50; paginate for exhaustive requests
 
 ## Entity types
 
@@ -115,17 +167,20 @@ From Reflector (recorded meetings + transcripts).
 
 ### `conversation` / `conversation_message` / `threaded_conversation`
 
-From Zulip / Babelfish.
+From Zulip / Slack / Babelfish / Notion (comments).
 
 - `conversation` — a stream/channel with `recent_messages: dict[]`.
-- `conversation_message` — single message with `message: string?` and `mentioned_contact_ids: string[]`.
+- `conversation_message` — single message with `message: string?` and `mentioned_contact_ids: string[]`. Notion comments use this type with `parent_id` pointing at the parent Notion page (`document`).
 - `threaded_conversation` — a topic thread under a stream with `recent_messages: dict[]`.
 
 For "discussions about X" use `threaded_conversation` + `search`. For "messages mentioning person Y" use `conversation_message` filtered by `contact_ids`.
 
 ### `document`
 
-From HedgeDoc, API ingestion, etc. Fields: `content`, `description`, `mimetype`, `url`, `revision_id`. Prefer `search` over `query_entities`-with-text-filter for body-content matching.
+From HedgeDoc, API ingestion, Notion pages, Float Financial records, etc. Fields: `content`, `description`, `mimetype`, `url`, `revision_id`. Prefer `search` over `query_entities`-with-text-filter for body-content matching.
+
+- **Notion pages** are rendered to markdown (`mimetype="text/markdown"`), have a `url` back to notion.so, and may set `parent_id` to another Notion page when nested.
+- **Float Financial records** are flattened to `text/plain` documents, one per record across `card-transactions`, `account-transactions`, `bills`, `payments`, `receipts`. `connector_metadata.resource_type` distinguishes them; raw fields live in `raw_data`. Filter to a specific kind by combining `connector_ids=["float_financial"]` with a `search` substring or post-filter on `connector_metadata.resource_type`.
 
 ### `webpage`
 
@@ -145,9 +200,12 @@ Contacts mirrored from ContactDB into DataIndex. **Read-only mirror** — for co
 | `ics_calendar` | `calendar_event` | Multiple feeds may exist as separate connectors (e.g. `personal_calendar`, `work_calendar`). |
 | `reflector` | `meeting` | Transcripts + summaries; see participant-coverage caveat above. |
 | `zulip` | `conversation`, `conversation_message`, `threaded_conversation` | |
-| `babelfish` | `conversation_message`, `threaded_conversation` | Translated cross-language chat. Query alongside `zulip` for full coverage. |
+| `slack` | `conversation`, `conversation_message`, `threaded_conversation` | |
+| `babelfish` | `conversation_message`, `threaded_conversation` | Translated cross-language chat. Query alongside `zulip` / `slack` for full coverage. |
 | `hedgedoc` | `document` | Use `search` for body content, not `query_entities` text filter. |
 | `api_document` | `document` | API-ingested documents (uploads, etc). |
+| `notion` | `document`, `conversation_message` | Pages → markdown documents (`mimetype="text/markdown"`); comments → `conversation_message` with `parent_id` set to the page. ID forms: `notion:page:<uuid>`, `notion:comment:<uuid>`. |
+| `float_financial` | `document` | Corporate financial records (card/account transactions, bills, payments, receipts) flattened into documents. Resource kind in `connector_metadata.resource_type`; raw API fields in `raw_data`. ID form: `float_financial:<resource_type>:<id>`. |
 | `browser_history` | `webpage` | |
 | `contactdb` | `contact` | Read-only mirror. Use ContactDB MCP for actual contact operations. |
 
@@ -198,14 +256,50 @@ Response shape: `{results: chunk[], total_count}`. Each chunk has `entity_ids`, 
 | "Meetings I attended" | `get_me` → `query_entities(entity_types=["meeting"], contact_ids=[my_id])` (then double-check via name search per the Reflector caveat) |
 | "What was discussed about the roadmap" | `search(query="product roadmap decisions", entity_types=["meeting","threaded_conversation","email"])` |
 | "Active contacts I haven't talked to recently" | `query_contacts(min_hotness=50, last_interaction_to=…, sort_by="hotness")` |
-| "All Zulip threads about hiring" | `search(query="hiring", entity_types=["threaded_conversation"], connector_ids=["zulip"])` |
+| "All Zulip/Slack threads about hiring" | `search(query="hiring", entity_types=["threaded_conversation"], connector_ids=["zulip","slack"])` |
 | "Upcoming calendar events" | `query_entities(entity_types=["calendar_event"], date_from=now, sort_order="asc")` |
 | "Show me the full email" | get the `id` from a search/query result, then `get_entity_by_id(id, max_content_length=null)` |
+| "Notion pages about onboarding" | `search(query="onboarding", entity_types=["document"], connector_ids=["notion"])` |
+| "Comments on a Notion page" | `query_entities(entity_types=["conversation_message"], parent_id="notion:page:<uuid>")` |
+| "Float card transactions this month" | `query_entities(entity_types=["document"], connector_ids=["float_financial"], date_from=…, search="card-transactions")` then post-filter on `connector_metadata.resource_type` if needed |
+| "All Float spend by Alice" | `query_contacts(search="Alice")` → `query_entities(entity_types=["document"], connector_ids=["float_financial"], contact_ids=[id])` |
 
-## Conventions
+## Correlating across sources
 
-- ID prefixes are stable: `mbsync_email:...`, `reflector:...`, `zulip:...`, etc. You can predict them from the connector ID.
+When stitching results from different connectors, weight evidence by:
+
+- temporal overlap / proximity
+- participant overlap (`contact_ids`)
+- mention overlap (`mentioned_contact_ids`)
+- thread / `parent_id` linkage
+- semantic similarity to the anchor topic
+
+Confidence:
+
+- **High** — strong temporal overlap **plus** at least one identity/linkage signal
+- **Medium** — temporal proximity **plus** semantic relevance
+- **Low** — semantic relevance only, no identity linkage
+
+## Output contract
+
+Unless the user asks for a raw dump, include in the reply:
+
+1. Matched person/contact used (or note none)
+2. Workflow used (from the catalog)
+3. Tool mode(s) used (`search`, `query_entities`, `get_entity_by_id`)
+4. Filters/windows used (entity types, connectors, date range, contact scope)
+5. Result count and notable caveats (truncation, `partial_failure`, missing connector coverage)
+
+Keep results concise.
+
+## Conventions and failure handling
+
+- ID prefixes are stable: `mbsync_email:...`, `reflector:...`, `zulip:...`, `slack:...`, `notion:page:...` / `notion:comment:...`, `float_financial:<resource_type>:...`, etc. You can predict them from the connector ID.
 - All dates are ISO-8601; treat naive datetimes as UTC.
 - Content fields (`text_content`, `transcript`, `summary`, `description`, `message`, `html_content`) auto-truncate at `max_content_length`. When the user asks for the full body, pass `max_content_length=null` (`query_entities` / `get_entity_by_id`).
 - The `contactdb` connector pseudo-ID inside DataIndex only mirrors contacts for unified search; **don't** use it for contact operations. Use the ContactDB MCP instead.
 - Reflector data is **incomplete by design** — always layer a transcript `search` on top of `contact_ids` filtering when the user is asking about meetings involving a person.
+- If multiple contacts plausibly match a name, ask the user to disambiguate before deep querying.
+- If an expected connector is missing, say so and suggest available alternatives from `list_connectors`.
+- If zero results, report the filters used and suggest the next broadening step (wider window, drop a filter, switch `search`↔`query_entities`).
+- Never fabricate content — only report retrieved data.
