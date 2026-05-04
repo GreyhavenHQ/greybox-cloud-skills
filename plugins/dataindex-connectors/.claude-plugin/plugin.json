@@ -2,7 +2,7 @@
   "name": "dataindex-connectors",
   "description": "Query the per-Greybox DataIndex + ContactDB MCP servers to find emails, meetings, calendar events, chat, and documents, and resolve people to contact_ids.",
   "version": "0.2.0",
-  "author": "GreyhavenHQ",
+  "author": { "name": "GreyhavenHQ", "url": "https://github.com/GreyhavenHQ" },
   "homepage": "https://github.com/GreyhavenHQ/greybox-cloud-skills",
   "license": "MIT"
 }
